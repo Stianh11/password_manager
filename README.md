@@ -1,6 +1,5 @@
-# PwP - Password Manager
-
-A secure, user-friendly password manager for Windows.
+# PwP - Password Protector
+A secure, user-friendly password manager.
 
 ## Features
 - **Master password protection**: All your passwords are encrypted using a key derived from your master password.
