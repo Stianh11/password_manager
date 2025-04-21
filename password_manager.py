@@ -2,28 +2,63 @@ import sqlite3
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+from base64 import urlsafe_b64encode, urlsafe_b64decode
+from argon2 import PasswordHasher  # Requires 'pip install argon2-cffi'
+from argon2.exceptions import VerifyMismatchError
 import os
 import pyperclip
 import random
 import string
 import configparser
+import time
 
 # --- Kryptering og nøkkelhåndtering ---
 KEY_FILE = "encryption.key"
 CONFIG_FILE = "config.ini"
 
-def generate_key():
-    """Genererer og lagrer en krypteringsnøkkel."""
-    key = Fernet.generate_key()
+def generate_and_encrypt_key(master_password):
+    """Genererer en Fernet-nøkkel, krypterer den med en nøkkel avledet fra masterpassordet, og lagrer den med salt."""
+    backend = default_backend()
+    salt = os.urandom(16)
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=390000,
+        backend=backend
+    )
+    key_derived = urlsafe_b64encode(kdf.derive(master_password.encode()))
+    fernet_key = Fernet.generate_key()
+    f = Fernet(key_derived)
+    encrypted_fernet_key = f.encrypt(fernet_key)
     with open(KEY_FILE, "wb") as key_file:
-        key_file.write(key)
+        key_file.write(salt + encrypted_fernet_key)
+    return fernet_key
 
-def load_key():
-    """Laster krypteringsnøkkelen fra fil."""
-    if not os.path.exists(KEY_FILE):
-        generate_key()
+def load_and_decrypt_key(master_password):
+    """Laster og dekrypterer Fernet-nøkkelen fra fil ved bruk av masterpassordet."""
+    backend = default_backend()
     with open(KEY_FILE, "rb") as key_file:
-        return key_file.read()
+        filedata = key_file.read()
+    salt = filedata[:16]
+    encrypted_fernet_key = filedata[16:]
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=390000,
+        backend=backend
+    )
+    key_derived = urlsafe_b64encode(kdf.derive(master_password.encode()))
+    f = Fernet(key_derived)
+    try:
+        fernet_key = f.decrypt(encrypted_fernet_key)
+        return fernet_key
+    except Exception:
+        return None
 
 def encrypt_password(password):
     """Krypterer et passord."""
@@ -33,26 +68,81 @@ def decrypt_password(encrypted_password):
     """Dekrypterer et passord."""
     return cipher_suite.decrypt(encrypted_password.encode()).decode()
 
-def create_config_file():
-    """Oppretter konfigurasjonsfilen med kryptert passord hvis den ikke finnes."""
-    if not os.path.exists(CONFIG_FILE):
+def create_config_and_key_files():
+    """Oppretter konfigurasjons- og nøkkelfil hvis de ikke finnes. Ber bruker om å velge et hovedpassord."""
+    if not os.path.exists(CONFIG_FILE) or not os.path.exists(KEY_FILE):
+        import tkinter.simpledialog
+        import tkinter.messagebox
+        root = tk.Tk()
+        root.withdraw()
+        while True:
+            password1 = tkinter.simpledialog.askstring("Sett hovedpassord", "Velg et hovedpassord:", show="*")
+            password2 = tkinter.simpledialog.askstring("Bekreft hovedpassord", "Bekreft hovedpassord:", show="*")
+            if password1 is None or password2 is None:
+                tkinter.messagebox.showerror("Avbrutt", "Du må angi et hovedpassord for å bruke programmet.")
+                root.destroy()
+                exit(1)
+            if password1 != password2:
+                tkinter.messagebox.showerror("Feil", "Passordene er ikke like. Prøv igjen.")
+            elif len(password1) < 8:
+                tkinter.messagebox.showerror("Feil", "Passordet må være minst 8 tegn.")
+            else:
+                break
+        ph = PasswordHasher()
+        hashed_password = ph.hash(password1)
         config = configparser.ConfigParser()
-        encrypted_password = encrypt_password("kalkun123")
-        config["security"] = {"password": encrypted_password}
+        config["security"] = {"password_hash": hashed_password}
         with open(CONFIG_FILE, "w") as config_file:
             config.write(config_file)
+        # Generate and encrypt Fernet key
+        generate_and_encrypt_key(password1)
+        root.destroy()
 
 # --- Les kryptert passord fra konfigurasjonsfil ---
-def load_encrypted_password():
+def load_password_hash():
     config = configparser.ConfigParser()
     config.read(CONFIG_FILE)
-    return config["security"]["password"]
+    return config["security"]["password_hash"]
 
 # --- Initialiser kryptering ---
-ENCRYPTION_KEY = load_key()
+def get_master_password_with_lockout():
+    import tkinter.simpledialog
+    import tkinter.messagebox
+    failed_attempts = 0
+    lockout_time = 30
+    max_attempts = 5
+    root = tk.Tk()
+    root.withdraw()
+    while True:
+        password = tkinter.simpledialog.askstring("Masterpassord", "Oppgi hovedpassord:", show="*")
+        if password is None:
+            tkinter.messagebox.showerror("Avbrutt", "Du må angi hovedpassord for å bruke programmet.")
+            root.destroy()
+            exit(1)
+        try:
+            ph.verify(load_password_hash(), password)
+            root.destroy()
+            return password
+        except VerifyMismatchError:
+            failed_attempts += 1
+            if failed_attempts >= max_attempts:
+                tkinter.messagebox.showwarning("Låst", f"For mange feil. Prøver igjen om {lockout_time} sekunder.")
+                root.update()
+                time.sleep(lockout_time)
+                failed_attempts = 0
+            else:
+                tkinter.messagebox.showerror("Feil", f"Ugyldig hovedpassord. {max_attempts-failed_attempts} forsøk igjen.")
+
+create_config_and_key_files()
+ph = PasswordHasher()
+master_password = get_master_password_with_lockout()
+ENCRYPTION_KEY = load_and_decrypt_key(master_password)
+if ENCRYPTION_KEY is None:
+    import tkinter.messagebox
+    tkinter.messagebox.showerror("Feil", "Kunne ikke dekryptere nøkkelfil. Feil hovedpassord eller fil korrupt.")
+    exit(1)
 cipher_suite = Fernet(ENCRYPTION_KEY)
-create_config_file()
-SECURITY_PASSWORD = decrypt_password(load_encrypted_password())
+SECURITY_PASSWORD_HASH = load_password_hash()
 
 # --- Databaseoppsett ---
 DB_FILE = "passwords.db"
@@ -115,16 +205,17 @@ def user_exists():
 
 def wipe_program(security_password):
     """Sletter alt fra databasen hvis sikkerhetspassordet er korrekt."""
-    if security_password == SECURITY_PASSWORD:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM users")
-        cursor.execute("DELETE FROM passwords")
-        conn.commit()
-        conn.close()
-        messagebox.showinfo("Suksess", "Alle data er slettet!")
-    else:
-        messagebox.showerror("Feil", "Ugyldig sikkerhetspassord!")
+    try:
+        ph.verify(SECURITY_PASSWORD_HASH, security_password)
+    except VerifyMismatchError:
+        return False
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users")
+    cursor.execute("DELETE FROM passwords")
+    conn.commit()
+    conn.close()
+    return True
 
 # --- Passordhåndtering ---
 def add_password_to_db(user_id, website, username, password):
@@ -166,7 +257,32 @@ class PasswordManagerApp:
         self.root = root
         self.root.title("Passord Manager")
         self.current_user_id = None
+        self.setup_menu()
         self.setup_ui()
+
+    def setup_menu(self):
+        menubar = tk.Menu(self.root)
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="About / Help", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=helpmenu)
+        self.root.config(menu=menubar)
+
+    def show_about(self):
+        about_text = (
+            "PwP - Password Manager\n\n"
+            "A secure, user-friendly password manager.\n\n"
+            "Features:\n"
+            "- All passwords are encrypted with a master password.\n"
+            "- Brute-force lockout for master password entry.\n"
+            "- Clipboard copy for easy password use.\n\n"
+            "Usage Tips:\n"
+            "- Always remember your master password!\n"
+            "- Use the 'Add Password' button to store new credentials.\n"
+            "- Use the Help menu for more info.\n\n"
+            "Developed by Stian."
+        )
+        messagebox.showinfo("About PwP", about_text)
+
 
     def setup_ui(self):
         """Setter opp brukergrensesnittet."""
@@ -193,7 +309,7 @@ class PasswordManagerApp:
     def show_password_manager(self):
         """Viser hovedskjermen for passordhåndtering."""
         self.clear_screen()
-        print("Viser passordhåndtering for bruker:", self.current_user_id)  # Debug-melding
+        # print("Viser passordhåndtering for bruker:", self.current_user_id)  # Debug-melding
 
         self.password_list = tk.Listbox(self.root, height=15, width=50)
         self.password_list.grid(row=0, column=0, columnspan=3, padx=10, pady=10)
@@ -218,10 +334,10 @@ class PasswordManagerApp:
         user_id = authenticate_user(username, password)
         if user_id:
             self.current_user_id = user_id
-            print("Innlogging vellykket, bruker-ID:", self.current_user_id)  # Debug-melding
+            # print("Innlogging vellykket, bruker-ID:", self.current_user_id)  # Debug-melding
             self.setup_ui()
         else:
-            print("Innlogging feilet for bruker:", username)  # Debug-melding
+            # print("Innlogging feilet for bruker:", username)  # Debug-melding
             messagebox.showerror("Feil", "Ugyldig brukernavn eller passord.")
 
     def register(self):
@@ -231,7 +347,7 @@ class PasswordManagerApp:
             return
 
         security_password = simpledialog.askstring("Sikkerhet", "Oppgi sikkerhetspassord:")
-        if security_password == SECURITY_PASSWORD:
+        if wipe_program(security_password):
             username = simpledialog.askstring("Registrer", "Velg brukernavn:")
             password = simpledialog.askstring("Registrer", "Velg passord (minst 8 tegn):", show="*")
             if len(password) >= 8:
@@ -251,9 +367,9 @@ class PasswordManagerApp:
         """Laster passordene inn i listen."""
         self.password_list.delete(0, tk.END)
         passwords = get_passwords_from_db(self.current_user_id)
-        print("Laster passord for bruker:", self.current_user_id)  # Debug-melding
+        # print("Laster passord for bruker:", self.current_user_id)  # Debug-melding
         for password in passwords:
-            print("Legger til passord i listen:", password)  # Debug-melding
+            # print("Legger til passord i listen:", password)  # Debug-melding
             self.password_list.insert(tk.END, f"{password[1]} ({password[2]})")
 
     def add_password(self):
@@ -311,21 +427,24 @@ class PasswordManagerApp:
     def delete_user_prompt(self):
         """Ber om bekreftelse for å slette brukeren."""
         security_password = simpledialog.askstring("Sikkerhet", "Oppgi sikkerhetspassord:")
-        if security_password == SECURITY_PASSWORD:
-            response = messagebox.askyesno("Bekreft sletting", "Er du sikker på at du vil slette alle data?")
-            if response:
-                confirm_delete = simpledialog.askstring("Bekreft sletting", "Skriv 'DELETE' for å bekrefte sletting:")
-                if confirm_delete == "DELETE":
-                    self.wipe_all_data()
-                else:
-                    messagebox.showwarning("Avbrutt", "Sletting avbrutt.")
-        else:
+        try:
+            ph.verify(SECURITY_PASSWORD_HASH, security_password)
+        except VerifyMismatchError:
             messagebox.showerror("Feil", "Ugyldig sikkerhetspassord.")
+            return
+        response = messagebox.askyesno("Bekreft sletting", "Er du sikker på at du vil slette alle data?")
+        if response:
+            confirm_delete = simpledialog.askstring("Bekreft sletting", "Skriv 'DELETE' for å bekrefte sletting:")
+            if confirm_delete == "DELETE":
+                self.wipe_all_data()
+            else:
+                messagebox.showwarning("Avbrutt", "Sletting avbrutt.")
 
     def wipe_all_data(self):
         """Sletter alle data fra databasen."""
-        wipe_program(SECURITY_PASSWORD)
-        self.logout()
+        security_password = simpledialog.askstring("Sikkerhet", "Oppgi sikkerhetspassord:")
+        if wipe_program(security_password):
+            self.logout()
 
 # --- Hovedprogram ---
 if __name__ == "__main__":
